@@ -1,6 +1,6 @@
 import path from "path"
 import { promises as fs } from "fs"
-import { execFileAsync, cookieArgs, MAX_FILESIZE, poTokenArgs, youtubeArgs, platformKey } from "./ytdlp"
+import { execFileAsync, cookieArgs, MAX_FILESIZE, platformKey } from "./ytdlp"
 import { validateMediaFile } from "./validate"
 import { safeFetch, readLimited, UnsafeUrlError } from "./security/safe-fetch"
 
@@ -352,10 +352,7 @@ export async function probeWithFallbacks(
   url: string,
   cookiesPath: string | null
 ): Promise<YtdlpEntry> {
-  const isYouTube = platformKey(url) === "youtube"
-  const ytArgs = isYouTube ? [...youtubeArgs(), ...poTokenArgs()] : []
-
-  const base = ["-J", "--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA, ...ytArgs]
+  const base = ["-J", "--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA]
   const noCookieBase = [...base]
   const withCookieBase = [...base, ...cookieArgs(cookiesPath)]
   const errors: string[] = []
@@ -452,10 +449,7 @@ export async function downloadWithFallbacks(opts: {
   const startTime = Date.now()
   const timeLeft = () => deadlineMs - (Date.now() - startTime)
 
-  const isYouTube = platformKey(url) === "youtube"
-  const ytArgs = isYouTube ? [...youtubeArgs(), ...poTokenArgs()] : []
-
-  const base = ["--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA, ...ytArgs]
+  const base = ["--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA]
   const noCookieBase = [...base]
   const withCookieBase = [...base, ...cookieArgs(cookiesPath)]
   const errors: string[] = []
