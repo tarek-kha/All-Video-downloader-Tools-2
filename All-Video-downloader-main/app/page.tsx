@@ -22,6 +22,9 @@ export default function HomePage() {
   const [fetchedUrl, setFetchedUrl] = useState("")
   const [history, setHistory] = useState<HistoryItem[]>([])
 
+  // FIX: AbortController to cancel previous fetch requests
+  const abortRef = { current: new AbortController() }
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(HISTORY_KEY)
@@ -40,7 +43,6 @@ export default function HomePage() {
     }
   }, [])
 
-  // Called the instant Download is clicked — item appears immediately.
   const handleQueued = useCallback(
     (item: HistoryItem) => {
       setHistory((prev) => {
@@ -56,7 +58,6 @@ export default function HomePage() {
     []
   )
 
-  // Called once the server responds — patches the same item with final state.
   const handleSettled = useCallback((id: string, patch: Partial<HistoryItem>) => {
     setHistory((prev) => {
       const next = prev.map((h) => (h.id === id ? { ...h, ...patch } : h))
@@ -82,6 +83,11 @@ export default function HomePage() {
     e?.preventDefault()
     const target = url.trim()
     if (!target) return
+
+    // FIX: Cancel previous fetch request
+    abortRef.current.abort()
+    abortRef.current = new AbortController()
+
     setLoading(true)
     setError(null)
     setInfo(null)
@@ -90,11 +96,13 @@ export default function HomePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: target }),
+        signal: abortRef.current.signal,
       })
       const data = await parseApiResponse<VideoInfo>(res)
       setInfo(data)
       setFetchedUrl(target)
     } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") return
       setError(err instanceof Error ? err.message : "Something went wrong")
     } finally {
       setLoading(false)
@@ -103,13 +111,11 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-muted/40">
-      {/* Top bar — compact cookie manager lives here now, not at the bottom */}
       <div className="container mx-auto max-w-3xl px-4 pt-4 flex justify-end">
         <CookieSettings />
       </div>
 
       <main className="container mx-auto max-w-3xl px-4 pt-4 pb-12 space-y-8">
-        {/* Hero */}
         <div className="text-center space-y-3">
           <div className="inline-flex items-center justify-center h-14 w-14 rounded-2xl bg-primary text-primary-foreground mb-1">
             <Video className="h-7 w-7" />
@@ -128,7 +134,6 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* URL input */}
         <form onSubmit={handleFetch} className="flex gap-2">
           <div className="relative flex-1">
             <button
@@ -169,7 +174,6 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* Result */}
         {info && (
           <VideoCard
             info={info}
@@ -179,7 +183,6 @@ export default function HomePage() {
           />
         )}
 
-        {/* Empty-state hint */}
         {!info && !loading && !error && history.length === 0 && (
           <div className="text-center text-sm text-muted-foreground py-8">
             <Download className="h-8 w-8 mx-auto mb-2 opacity-40" />
@@ -187,7 +190,6 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* History */}
         <HistoryList
           items={history}
           onClear={() => saveHistory([])}
@@ -196,7 +198,7 @@ export default function HomePage() {
 
         <p className="text-center text-xs text-muted-foreground pt-4">
           Only download content you have the right to save. Respect each platform&apos;s terms of
-          service and copyright law.
+          service and copyright.
         </p>
       </main>
     </div>
