@@ -20,52 +20,59 @@ function attachSessionCookie(res: NextResponse, sessionId: string) {
 }
 
 export async function POST(request: NextRequest) {
+  console.log("[INFO] ====== NEW REQUEST ======")
   try {
-    console.log("[INFO] Request received")
-
+    console.log("[INFO] Step 1: Rate limit check")
     if (!checkRateLimit(`info:${clientKey(request)}`, 20, 60_000)) {
+      console.log("[INFO] Rate limited")
       return NextResponse.json({ error: "Too many requests — please slow down and try again in a minute." }, { status: 429 })
     }
 
     let url = ""
     try {
+      console.log("[INFO] Step 2: Parse body")
       const body = await request.json()
       url = String(body?.url ?? "").trim()
       console.log("[INFO] URL:", url)
-    } catch {
+    } catch (e) {
+      console.log("[INFO] Body parse error:", e)
       return NextResponse.json({ error: "Invalid request body" }, { status: 400 })
     }
 
     if (!isValidUrl(url)) {
+      console.log("[INFO] Invalid URL")
       return NextResponse.json({ error: "Please enter a valid http(s) URL" }, { status: 400 })
     }
 
-    console.log("[INFO] Checking safety...")
+    console.log("[INFO] Step 3: Safety check")
     const safety = await isSafeToFetch(url)
     if (!safety.ok) {
+      console.log("[INFO] Unsafe URL")
       return NextResponse.json({ error: "This URL points to a private/internal address and cannot be fetched." }, { status: 400 })
     }
 
-    console.log("[INFO] Acquiring guard...")
+    console.log("[INFO] Step 4: Acquire guard")
     if (!extractGuard.tryAcquire()) {
+      console.log("[INFO] Guard busy")
       return NextResponse.json(
         { error: "The server is busy handling other requests right now — please try again in a few seconds." },
         { status: 503 }
       )
     }
 
-    console.log("[INFO] Getting session...")
+    console.log("[INFO] Step 5: Get session")
     const { sessionId, isNew } = getOrCreateSessionId(request.cookies.get(SESSION_COOKIE)?.value)
     const cookiesPath = cookiesPathForPlatform(sessionId, platformKey(url))
-    console.log("[INFO] Session:", sessionId, "Cookies:", cookiesPath)
+    console.log("[INFO] Session:", sessionId, "isNew:", isNew)
 
     try {
-      console.log("[INFO] Probing:", url)
+      console.log("[INFO] Step 6: Probe start")
       const entry = await probeWithFallbacks(url, cookiesPath)
-      console.log("[INFO] Probe success:", entry.title)
+      console.log("[INFO] Step 6: Probe success, title:", entry.title)
 
       if (!entry) throw new Error("No video found at this URL")
 
+      console.log("[INFO] Step 7: Build response")
       const heights: number[] = Array.isArray(entry.formats)
         ? entry.formats
             .map((f: { height?: number | null }) => f.height ?? 0)
@@ -94,27 +101,74 @@ export async function POST(request: NextRequest) {
         formats,
         resolveId,
       }
+
+      console.log("[INFO] Step 8: Send success response")
       const res = NextResponse.json(info)
       if (isNew) attachSessionCookie(res, sessionId)
+      console.log("[INFO] ====== SUCCESS ======")
       return res
     } catch (err: unknown) {
-      console.error("[INFO] Probe error:", err)
+      console.log("[INFO] Step 6/7: Probe/Build error:", err)
+      console.log("[INFO] Error type:", typeof err)
+      console.log("[INFO] Error instanceof Error:", err instanceof Error)
+
+      if (err instanceof Error) {
+        console.log("[INFO] Error message:", err.message)
+        console.log("[INFO] Error has failure?:", 'failure' in err)
+        if ('failure' in err) {
+          console.log("[INFO] Error.failure:", JSON.stringify((err as any).failure))
+        }
+      }
+
       const msg = err instanceof Error ? err.message : "Failed to fetch video info"
-      const failure = classifyFailure(msg, "resolve")
-      const res = NextResponse.json(
-        { error: failure.message, category: failure.category, detail: failure.detail },
-        { status: 422 }
-      )
-      if (isNew) attachSessionCookie(res, sessionId)
+      console.log("[INFO] Classifying message:", msg.substring(0, 100))
+
+      let failure
+      try {
+        failure = classifyFailure(msg, "resolve")
+        console.log("[INFO] Classification result:", JSON.stringify(failure))
+      } catch (classifyErr) {
+        console.log("[INFO] classifyFailure threw:", classifyErr)
+        failure = { category: "INTERNAL_ERROR", message: "Request failed due to an internal server error.", detail: msg }
+      }
+
+      console.log("[INFO] Step 9: Build error response")
+      let res
+      try {
+        res = NextResponse.json(
+          { error: failure.message, category: failure.category, detail: failure.detail },
+          { status: 422 }
+        )
+        console.log("[INFO] Response built successfully")
+      } catch (responseErr) {
+        console.log("[INFO] NextResponse.json threw:", responseErr)
+        return NextResponse.json({ error: "Server error building response" }, { status: 500 })
+      }
+
+      if (isNew) {
+        console.log("[INFO] Attaching session cookie")
+        try {
+          attachSessionCookie(res, sessionId)
+          console.log("[INFO] Cookie attached")
+        } catch (cookieErr) {
+          console.log("[INFO] attachSessionCookie threw:", cookieErr)
+        }
+      }
+
+      console.log("[INFO] ====== RETURNING 422 ======")
       return res
     } finally {
+      console.log("[INFO] Releasing guard")
       extractGuard.release()
+      console.log("[INFO] Guard released")
     }
   } catch (err: unknown) {
-    console.error("[INFO] UNCAUGHT ERROR:", err)
+    console.error("[INFO] ====== UNCAUGHT ERROR ======")
+    console.error("[INFO] Error:", err)
     const msg = err instanceof Error ? err.message : String(err)
+    console.error("[INFO] Message:", msg)
     return NextResponse.json(
-      { error: `Server error: ${msg}`, detail: err instanceof Error ? err.stack : undefined },
+      { error: `Server error: ${msg}` },
       { status: 500 }
     )
   }
