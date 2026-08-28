@@ -1,7 +1,12 @@
 export async function parseApiResponse<T>(res: Response): Promise<T> {
   const contentType = (res.headers.get("content-type") || "").toLowerCase()
   if (contentType.includes("application/json")) {
-    const data = (await res.json()) as T & { error?: string }
+    let data: T & { error?: string }
+    try {
+      data = await res.json()
+    } catch {
+      throw new Error("Server returned invalid JSON")
+    }
     if (!res.ok) throw new Error(data?.error || fallbackMessage(res.status))
     return data
   }
