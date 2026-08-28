@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -34,11 +34,7 @@ function formatBytes(n: number): string {
 interface VideoCardProps {
   info: VideoInfo
   sourceUrl: string
-  /** Called IMMEDIATELY when Download is clicked (status: "downloading") so
-   * the item appears in history right away, before the server responds. */
   onQueued: (item: HistoryItem) => void
-  /** Called once the server responds, patching the same history item by id
-   * with the final status ("complete" or "failed") and result details. */
   onSettled: (id: string, patch: Partial<HistoryItem>) => void
 }
 
@@ -48,13 +44,18 @@ export function VideoCard({ info, sourceUrl, onQueued, onSettled }: VideoCardPro
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<DownloadResult | null>(null)
 
+  // FIX: Reset state when new video info arrives
+  useEffect(() => {
+    setDone(null)
+    setError(null)
+    setQuality(info.formats[0]?.value ?? "best")
+  }, [info])
+
   const handleDownload = async () => {
     setDownloading(true)
     setError(null)
     setDone(null)
 
-    // Instant feedback: add the history item right away, before the network
-    // request even starts, so the user sees it appear immediately.
     const historyId = crypto.randomUUID()
     onQueued({
       id: historyId,
@@ -73,9 +74,6 @@ export function VideoCard({ info, sourceUrl, onQueued, onSettled }: VideoCardPro
       const res = await fetch("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Send the resolveId from /api/info's response when available so the
-        // server can reuse the already-resolved context (Phase 2) instead of
-        // re-deriving platform/cookie info from the raw URL again.
         body: JSON.stringify({ url: sourceUrl, quality, resolveId: info.resolveId }),
       })
       const data = await parseApiResponse<DownloadResult>(res)
@@ -85,8 +83,13 @@ export function VideoCard({ info, sourceUrl, onQueued, onSettled }: VideoCardPro
         fileId: data.fileId,
         status: "complete",
       })
-      // Trigger the browser download
-      window.location.href = `/api/file/${data.fileId}`
+      // FIX: Use <a download> instead of window.location.href
+      const a = document.createElement("a")
+      a.href = `/api/file/${data.fileId}`
+      a.download = data.filename || "download"
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "Download failed"
       setError(message)
@@ -95,6 +98,11 @@ export function VideoCard({ info, sourceUrl, onQueued, onSettled }: VideoCardPro
       setDownloading(false)
     }
   }
+
+  // FIX: Proxy thumbnail through /api/thumb
+  const displayThumb = info.thumbnail
+    ? `/api/thumb?url=${encodeURIComponent(info.thumbnail)}&name=thumb`
+    : null
 
   const thumbHref = info.thumbnail
     ? `/api/thumb?url=${encodeURIComponent(info.thumbnail)}&name=${encodeURIComponent(
@@ -106,10 +114,9 @@ export function VideoCard({ info, sourceUrl, onQueued, onSettled }: VideoCardPro
     <Card className="overflow-hidden">
       <CardContent className="p-0">
         <div className="flex flex-col sm:flex-row">
-          {info.thumbnail && (
-            // eslint-disable-next-line @next/next/no-img-element
+          {displayThumb && (
             <img
-              src={info.thumbnail}
+              src={displayThumb}
               alt={info.title}
               className="h-48 w-full sm:w-72 object-cover shrink-0"
             />
