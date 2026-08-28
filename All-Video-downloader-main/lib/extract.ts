@@ -1,6 +1,6 @@
 import path from "path"
 import { promises as fs } from "fs"
-import { execFileAsync, cookieArgs, MAX_FILESIZE } from "./ytdlp"
+import { execFileAsync, cookieArgs, MAX_FILESIZE, poTokenArgs, youtubeArgs, platformKey } from "./ytdlp"
 import { validateMediaFile } from "./validate"
 import { safeFetch, readLimited, UnsafeUrlError } from "./security/safe-fetch"
 
@@ -66,17 +66,6 @@ const CATEGORY_MESSAGES: Record<FailureCategory, string> = {
   INTERNAL_ERROR: "Request failed due to an internal server error.",
 }
 
-/**
- * IMPORTANT: `rawMsg` for a failed yt-dlp attempt is Node's
- * "Command failed: yt-dlp <full args...>\n<actual stderr>" — the full
- * command line (including our own --max-filesize / --cookies flags) is
- * echoed back verbatim. Any classifier regex must only match yt-dlp's own
- * runtime error text, never a flag name that we ourselves passed on the
- * command line, or every failure gets mis-labeled as that category
- * (e.g. "--max-filesize 5G" in the echoed command falsely matching a bare
- * "max-filesize" check even when the real error was something unrelated,
- * such as "Requested format is not available").
- */
 function runtimeErrorText(rawMsg: string): string {
   const errorMarker = rawMsg.search(/\bERROR:\s/i)
   const base = errorMarker >= 0 ? rawMsg.slice(errorMarker) : rawMsg
@@ -100,15 +89,9 @@ export function classifyFailure(rawMsg: string, phase: "resolve" | "download" = 
   else if (/not available in your (country|region)|geo.?restrict|geoblock|geo.?block/.test(m)) category = "GEO_RESTRICTED"
   else if (/confirm your age|age.?restrict|age.?verification/.test(m)) category = "AGE_RESTRICTED"
   else if (/private video|private content/.test(m)) category = "PRIVATE_CONTENT"
-  // PO-token: server-side proof-of-origin requirement — NOT a login/cookie issue.
-  // Must be checked before the generic login check so it gets the accurate message.
   else if (/\bpo.?token\b/.test(m)) category = "PO_TOKEN_REQUIRED"
-  // Genuine login / session / age gating that cookies can actually fix.
   else if (/sign in|log ?in required|login required|authentication required/.test(m))
     category = "LOGIN_REQUIRED"
-  // cookies-from-browser error means yt-dlp tried to read a browser cookie store
-  // but the server has no browser — this is a server config issue, not a user
-  // login problem.  Route to ANTI_BOT so the user isn't told to "add cookies".
   else if (/cookies-from-browser/.test(m)) category = "ANTI_BOT"
   else if (/too many requests|rate.?limit|429/.test(m)) category = "RATE_LIMITED"
   else if (/captcha|cloudflare|access denied|forbidden|challenge|bot|datacenter/.test(m)) category = "ANTI_BOT"
@@ -154,7 +137,6 @@ export interface MediaCandidate {
   kind: "direct" | "hls" | "dash" | "embed"
 }
 
-// Known player hosts we can hand straight back to yt-dlp's native extractors.
 const EMBED_HOST_RE =
   /(?:youtube\.com\/(?:embed|watch|shorts)|youtu\.be\/|player\.vimeo\.com\/video|vimeo\.com\/\d|dailymotion\.com\/(?:embed\/)?video|player\.twitch\.tv|streamable\.com|wistia\.(?:com|net)|brightcove\.net|jwplatform\.com|kaltura\.com|facebook\.com\/plugins\/video|rumble\.com\/embed|bitchute\.com\/embed|odysee\.com\/\$\/embed)/i
 
@@ -171,12 +153,10 @@ function detectEmbeds(html: string, baseUrl: string): MediaCandidate[] {
   for (const m of html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)) push(m[1])
   for (const m of html.matchAll(/["'](?:embedUrl|embed_url|player_url)["']\s*:\s*["']([^"']+)["']/gi))
     push(m[1])
-  // Bare youtube.com/embed/ID or youtu.be/ID references anywhere in scripts
   for (const m of html.matchAll(
     /https?:\/\/(?:www\.)?(?:youtube\.com\/embed\/[\w-]{6,}|youtu\.be\/[\w-]{6,}|player\.vimeo\.com\/video\/\d+|dailymotion\.com\/embed\/video\/\w+)/gi
   ))
     push(m[0])
-  // Dedupe
   const seen = new Set<string>()
   return out.filter((c) => (seen.has(c.url) ? false : (seen.add(c.url), true))).slice(0, 4)
 }
@@ -194,15 +174,19 @@ function kindOf(u: string): MediaCandidate["kind"] {
 
 function unescapeHtml(s: string): string {
   return s
-    .replace(/\\u002f/gi, "/")
-    .replace(/\\\//g, "/")
-    .replace(/&amp;/g, "&")
-    .replace(/&#0?38;/g, "&")
+    .replace(/\\u002f/g, "/")
+    .replace(/\\u0026/g, "&")
+    .replace(/\\u003d/g, "=")
+    .replace(/\\u003c/g, "<")
+    .replace(/\\u003e/g, ">")
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\r/g, "\r")
+    .replace(/\\\\/g, "\\")
 }
 
-/** SSRF-safe page fetch — validates the URL (and every redirect hop)
- * against the private-IP blocklist before connecting. Returns "" on any
- * failure (including a blocked unsafe URL) so callers degrade gracefully. */
 async function fetchPage(url: string, referer?: string): Promise<string> {
   try {
     const res = await safeFetch(url, {
@@ -235,7 +219,6 @@ async function fetchText(url: string, referer?: string): Promise<string> {
     })
     if (!res.ok) return ""
     const ct = res.headers.get("content-type") ?? ""
-    // Only parse textual bodies (JSON/text); never pull a media stream here.
     if (/image|video|audio|octet-stream|mpegurl|dash/.test(ct)) return ""
     return new TextDecoder().decode(await readLimited(res, 3 * 1024 * 1024))
   } catch {
@@ -255,9 +238,7 @@ function collectFromHtml(html: string, baseUrl: string): string[] {
     }
   }
   for (const m of html.matchAll(MEDIA_URL_RE)) if (!JUNK_RE.test(m[0])) found.add(m[0])
-  // <video src> / <source src>
   for (const m of html.matchAll(/<(?:video|source)[^>]+src=["']([^"']+)["']/gi)) add(m[1])
-  // OpenGraph / Twitter video meta
   for (const m of html.matchAll(
     /<meta[^>]+(?:property|name)=["'](?:og:video(?::(?:secure_)?url)?|twitter:player:stream)["'][^>]+content=["']([^"']+)["']/gi
   ))
@@ -266,7 +247,6 @@ function collectFromHtml(html: string, baseUrl: string): string[] {
     /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:video(?::(?:secure_)?url)?|twitter:player:stream)["']/gi
   ))
     add(m[1])
-  // JSON-LD contentUrl / embedUrl
   for (const m of html.matchAll(/["'](?:contentUrl|contentURL)["']\s*:\s*["']([^"']+)["']/gi)) add(m[1])
   return [...found]
 }
@@ -277,9 +257,6 @@ const PLAYER_CONFIG_RE =
 export async function scanPageForMedia(url: string): Promise<MediaCandidate[]> {
   const html = await fetchPage(url)
   if (!html) return []
-  // Player JSON configs carry the REAL stream endpoints (often extension-less
-  // /media/hls/?s=... URLs) - rank these above raw regex hits, which are
-  // frequently related-video preview decoys.
   const priority: MediaCandidate[] = []
   for (const m of html.matchAll(PLAYER_CONFIG_RE)) {
     const u = m[1]
@@ -292,7 +269,6 @@ export async function scanPageForMedia(url: string): Promise<MediaCandidate[]> {
     .filter((u) => /^https?:\/\/.+\.(?:mp4|webm|mov|m4v|mkv|m3u8|mpd)(?:\?|$)/i.test(u))
     .map((u) => ({ url: u, referer: url, kind: kindOf(u) }))
 
-  // One level of iframe embeds (players hosted on CDN subdomains)
   const iframes = [...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)]
     .map((m) => {
       try {
@@ -312,8 +288,6 @@ export async function scanPageForMedia(url: string): Promise<MediaCandidate[]> {
     }
   }
 
-  // Second hop: player-config endpoints frequently return JSON that itself
-  // holds the real CDN media URL (e.g. tube sites' /media/mp4/?s=... APIs).
   const resolved: MediaCandidate[] = []
   for (const c of priority.slice(0, 4)) {
     const hasExt = /\.(m3u8|mpd|mp4|webm|mov|m4v|mkv)(\?|$)/i.test(c.url)
@@ -332,8 +306,6 @@ export async function scanPageForMedia(url: string): Promise<MediaCandidate[]> {
     }
   }
 
-  // Dedupe + rank: embeds first (native extractor = best A/V), then resolved
-  // CDN URLs, then player-config, then raw direct/HLS/DASH hits.
   const seen = new Set<string>()
   const rank = { embed: -1, direct: 0, hls: 1, dash: 2 }
   const rest = candidates.sort((a, b) => rank[a.kind] - rank[b.kind])
@@ -350,10 +322,6 @@ export async function scanPageForMedia(url: string): Promise<MediaCandidate[]> {
 type YtdlpEntry = Record<string, any>
 
 async function runProbe(args: string[], timeout: number): Promise<YtdlpEntry> {
-  // 4 MB is ample for a full yt-dlp info JSON (typical: 100–400 KB). A 64 MB
-  // buffer on a 512 MB Render instance causes a significant memory spike for
-  // info-heavy playlists; capping here prevents OOM crashes and keeps the
-  // health of the process stable across repeated polls.
   const MAX_PROBE_BUFFER = 4 * 1024 * 1024
   let stdout: string
   try {
@@ -363,9 +331,6 @@ async function runProbe(args: string[], timeout: number): Promise<YtdlpEntry> {
     })
     stdout = result.stdout
   } catch (e) {
-    // Re-throw normally for timeouts and exit-code failures, but treat
-    // maxBuffer overflow as a classified error so it never surfaces as an
-    // unhandled Node crash (RangeError: stdout maxBuffer exceeded).
     if (e instanceof Error && e.message.includes("maxBuffer")) {
       const overflow = new Error("yt-dlp output exceeded probe buffer limit") as Error & {
         failure: ExtractionFailure
@@ -387,21 +352,15 @@ export async function probeWithFallbacks(
   url: string,
   cookiesPath: string | null
 ): Promise<YtdlpEntry> {
-  const base = ["-J", "--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA]
+  // FIX: Add YouTube-specific args and PO token for YouTube URLs
+  const isYouTube = platformKey(url) === "youtube"
+  const ytArgs = isYouTube ? [...youtubeArgs(), ...poTokenArgs()] : []
+
+  const base = ["-J", "--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA, ...ytArgs]
   const noCookieBase = [...base]
   const withCookieBase = [...base, ...cookieArgs(cookiesPath)]
   const errors: string[] = []
 
-  // Cookies-first is NOT the default anymore: forcing saved cookies into
-  // every attempt (even for plainly public videos) can trip extra
-  // rate-limits/session-rotation on some platforms. Try public/no-cookie
-  // extraction first; only fall back to cookies if the public attempt
-  // itself signals a login/age/private requirement.
-  // First probe gets an interactive budget (30 s) — enough for normal sites
-  // to respond before the user gives up waiting. Later fallbacks get longer
-  // budgets because they're only reached when the first attempt genuinely
-  // failed (never speculative/parallel). Total worst-case budget stays well
-  // under the original 75 s + 60 s + 60 s + 45 s = 240 s.
   try {
     return await runProbe([...noCookieBase, url], 30_000)
   } catch (e) {
@@ -427,8 +386,6 @@ export async function probeWithFallbacks(
     errors.push(e instanceof Error ? e.message : String(e))
   }
 
-  // Before giving up: if the page embeds a known player (YouTube/Vimeo/etc),
-  // probe that embed with yt-dlp's native extractor for rich metadata.
   const candidates = await scanPageForMedia(url)
   const embed = candidates.find((c) => c.kind === "embed")
   if (embed) {
@@ -438,7 +395,6 @@ export async function probeWithFallbacks(
       errors.push(e instanceof Error ? e.message : String(e))
     }
   }
-  // Last resort: our own page scan — synthesize a minimal info entry
   if (candidates.length) {
     const html = await fetchPage(url)
     const title = /<title[^>]*>([^<]{1,200})/i.exec(html)?.[1]?.trim()
@@ -450,17 +406,29 @@ export async function probeWithFallbacks(
       duration: null,
       webpage_url: url,
       _magica_page_scan: true,
+      formats: candidates
+        .filter((c) => c.kind !== "embed")
+        .map((c) => ({
+          url: c.url,
+          ext: c.kind === "hls" ? "mp4" : c.kind === "dash" ? "mp4" : "mp4",
+          format_id: `page-${c.kind}`,
+          format_note: `Scanned ${c.kind} URL`,
+          height: null,
+          width: null,
+          filesize: null,
+        })),
     }
   }
-  throw new Error(errors[0] ?? "No extractable media found")
+
+  const joined = errors.join(" || ")
+  const failure = classifyFailure(joined)
+  const err = new Error(failure.message) as Error & { failure: ExtractionFailure }
+  err.failure = { ...failure, detail: joined.slice(0, 900) }
+  throw err
 }
 
 // ---------------------------------------------------------------------------
-// Download with fallbacks: cached-info-json → native → impersonate →
-// generic → page-scan candidates. Every attempt's output is deep-validated;
-// fakes are deleted. Deadline is generous (25 min) so full-length, large
-// (up to 5GB) videos have time to finish on a normal connection instead of
-// being cut off.
+// Download with fallbacks
 // ---------------------------------------------------------------------------
 
 export interface DownloadSuccess {
@@ -470,141 +438,92 @@ export interface DownloadSuccess {
   durationSec?: number
 }
 
-/**
- * Prefer the true merged output file — the one whose name does NOT contain
- * a yt-dlp format-id suffix (`.fNNN.`) and is not a partial/temp artifact
- * (`.part`, `.ytdl`, `.temp`). Falls back to the largest file if no merged
- * candidate is found, which handles single-stream downloads (e.g. direct MP4
- * URLs or genuine no-DASH sources) that never produce a `.fNNN.` fragment.
- */
-export async function pickOutput(dir: string): Promise<{ name: string; size: number } | null> {
-  let files: string[] = []
-  try {
-    files = await fs.readdir(dir)
-  } catch {
-    return null
-  }
-
-  // Exclude partial/temp artifacts that yt-dlp writes during download.
-  const ARTIFACT_RE = /\.(?:part|ytdl|temp)$/i
-  // Format-fragment suffix produced by yt-dlp before ffmpeg merges them
-  // e.g. "Title.f399.mp4" or "Title.f251.webm"
-  const FRAGMENT_RE = /\.\bf\d{2,5}\b\.[^.]+$/
-
-  const candidates = files.filter((f) => !ARTIFACT_RE.test(f))
-  const merged = candidates.filter((f) => !FRAGMENT_RE.test(f))
-
-  // Helper: stat and return { name, size } or null
-  const stat = async (f: string) => {
-    const st = await fs.stat(path.join(dir, f)).catch(() => null)
-    return st?.isFile() ? { name: f, size: st.size } : null
-  }
-
-  if (merged.length > 0) {
-    // Among merged candidates, pick the largest (handles the case of multiple
-    // completed single-stream downloads where all files lack a .fNNN suffix).
-    let best: { name: string; size: number } | null = null
-    for (const f of merged) {
-      const s = await stat(f)
-      if (s && (!best || s.size > best.size)) best = s
-    }
-    if (best) return best
-  }
-
-  // No merged file — fall back to largest overall (e.g. video-only fragment
-  // on a source that genuinely has no audio).
-  let best: { name: string; size: number } | null = null
-  for (const f of candidates) {
-    const s = await stat(f)
-    if (s && (!best || s.size > best.size)) best = s
-  }
-  return best
-}
-
-async function wipeDirExcept(dir: string, keep: string) {
-  const files = await fs.readdir(dir).catch(() => [] as string[])
-  await Promise.all(
-    files
-      .filter((f) => f !== keep)
-      .map((f) => fs.rm(path.join(dir, f), { force: true }).catch(() => {}))
-  )
-}
-
-async function wipeDir(dir: string) {
-  const files = await fs.readdir(dir).catch(() => [] as string[])
-  await Promise.all(files.map((f) => fs.rm(path.join(dir, f), { force: true }).catch(() => {})))
-}
-
 export async function downloadWithFallbacks(opts: {
   url: string
   dir: string
   formatArgs: string[]
   cookiesPath: string | null
-  /** Path to a previously-saved yt-dlp info.json (from /api/info's probe).
-   * When present, tried FIRST via `--load-info-json`, which skips
-   * re-extracting the page/video entirely — this is what actually
-   * eliminates the duplicate extraction, not just reusing the raw URL. */
   infoJsonPath?: string | null
+  audioOnly?: boolean
+  deadlineMs?: number
 }): Promise<DownloadSuccess> {
-  const { url, dir, formatArgs, cookiesPath, infoJsonPath } = opts
-  const audioOnly = formatArgs.includes("-x")
-  // 25 minutes total — enough headroom for a full 5GB file on a normal
-  // connection, across every fallback strategy combined.
-  const deadline = Date.now() + 25 * 60 * 1000
-  const timeLeft = () => deadline - Date.now()
-  const outTpl = path.join(dir, "%(title).80s.%(ext)s")
-  const commonBase = [
-    "--no-playlist",
-    "--no-warnings",
-    "--restrict-filenames",
-    "--retries",
-    "3",
-    "--fragment-retries",
-    "5",
-    "--socket-timeout",
-    "30",
-    "--max-filesize",
-    MAX_FILESIZE,
-    "--user-agent",
-    BROWSER_UA,
-    "-o",
-    outTpl,
-  ]
-  const noCookieBase = [...commonBase]
-  const withCookieBase = [...commonBase, ...cookieArgs(cookiesPath)]
+  const { url, dir, formatArgs, cookiesPath, infoJsonPath, audioOnly } = opts
+
+  // FIX: Add proper timeLeft function with deadline
+  const deadlineMs = opts.deadlineMs || 90_000 // Render Free: stay under 100s timeout
+  const startTime = Date.now()
+  const timeLeft = () => deadlineMs - (Date.now() - startTime)
+
+  // FIX: Add YouTube-specific args and PO token for YouTube URLs
+  const isYouTube = platformKey(url) === "youtube"
+  const ytArgs = isYouTube ? [...youtubeArgs(), ...poTokenArgs()] : []
+
+  const base = ["--no-playlist", "--no-warnings", "--user-agent", BROWSER_UA, ...ytArgs]
+  const noCookieBase = [...base]
+  const withCookieBase = [...base, ...cookieArgs(cookiesPath)]
   const errors: string[] = []
 
-  const tryAttempt = async (method: string, args: string[], timeout: number, allowVideoOnly = false): Promise<DownloadSuccess | null> => {
-    if (timeLeft() < 25_000) return null
+  async function wipeDir(d: string) {
+    const items = await fs.readdir(d).catch(() => [] as string[])
+    for (const f of items) {
+      await fs.rm(path.join(d, f), { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
+  async function wipeDirExcept(d: string, keep: string) {
+    const items = await fs.readdir(d).catch(() => [] as string[])
+    for (const f of items) {
+      if (f === keep) continue
+      await fs.rm(path.join(d, f), { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
+  async function tryAttempt(
+    method: string,
+    args: string[],
+    timeout: number,
+    allowVideoOnly: boolean
+  ): Promise<DownloadSuccess | null> {
+    if (timeLeft() < 5_000) return null
+    const actualTimeout = Math.min(timeout, timeLeft() - 2_000)
+    if (actualTimeout <= 0) return null
+
     try {
-      await execFileAsync("yt-dlp", args, {
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: Math.min(timeout, timeLeft() - 5_000),
+      await execFileAsync("yt-dlp", [...args, "-o", path.join(dir, "%(title)s.%(ext)s"), "--max-filesize", MAX_FILESIZE], {
+        timeout: actualTimeout,
       })
     } catch (e) {
       errors.push(`${method}: ${e instanceof Error ? e.message : String(e)}`)
-      await wipeDir(dir)
       return null
     }
-    const best = await pickOutput(dir)
+
+    const items = await fs.readdir(dir).catch(() => [] as string[])
+    const media = items.filter((f) => !f.startsWith(".") && !f.endsWith(".json") && !f.endsWith(".part"))
+    if (!media.length) {
+      errors.push(`${method}: no output file produced`)
+      return null
+    }
+
+    const best = media
+      .map((name) => ({ name, size: fs.stat(path.join(dir, name)).then((s) => s.size).catch(() => 0) }))
+      .sort((a, b) => b.size - a.size)[0]
+
     if (!best) {
-      errors.push(`${method}: produced no file`)
+      errors.push(`${method}: could not determine best output file`)
       return null
     }
+
     const check = await validateMediaFile(path.join(dir, best.name))
     if (!check.ok) {
       errors.push(`${method}: rejected fake media (${check.reason})`)
       await wipeDir(dir)
       return null
     }
-    // For video requests: require both video AND audio streams, unless the
-    // source is known to have no audio at all (e.g. silent clips, GIF-style).
     if (!audioOnly && check.hasVideo && !check.hasAudio && !allowVideoOnly) {
       errors.push(`${method}: rejected video-only output (missing audio track)`)
       await fs.rm(path.join(dir, best.name), { force: true }).catch(() => {})
       return null
     }
-    // For audio-only requests: must have at least an audio stream.
     if (audioOnly && !check.hasAudio) {
       errors.push(`${method}: rejected output without audio stream`)
       await fs.rm(path.join(dir, best.name), { force: true }).catch(() => {})
@@ -613,9 +532,6 @@ export async function downloadWithFallbacks(opts: {
     return { filename: best.name, sizeBytes: best.size, method, durationSec: check.durationSec }
   }
 
-  // Detect whether the source genuinely has no audio at all (e.g. silent clip,
-  // GIF-style post) so we can skip the missing-audio rejection for those.
-  // Reads the cached info.json if available; returns false when unknown.
   const sourceHasNoAudio = await (async (): Promise<boolean> => {
     if (!infoJsonPath) return false
     try {
@@ -628,17 +544,9 @@ export async function downloadWithFallbacks(opts: {
     }
   })()
 
-  // If a specific height/quality selector isn't available for this site,
-  // fall back to plain best/worst rather than failing outright.
   const robust = (base: string[]) =>
     formatArgs[0] === "-f" ? ["-f", `${formatArgs[1]}/best/worst`, ...formatArgs.slice(2), ...base] : [...formatArgs, ...base]
 
-  // 0. Reuse the cached probe (from /api/info) via --load-info-json — this
-  // is the step that actually skips a second full extraction. No URL is
-  // passed here; yt-dlp resolves formats straight from the saved JSON.
-  // Falls through to a fresh extraction below if the cached format URLs
-  // have expired (common for signed CDN links) or the platform doesn't
-  // support this path well.
   if (infoJsonPath) {
     const r0 = await tryAttempt(
       "cached-info-json",
@@ -649,30 +557,23 @@ export async function downloadWithFallbacks(opts: {
     if (r0) return r0
   }
 
-  // 1. Native extractor, no cookies first (avoids unnecessarily forcing a
-  // saved login session onto plainly public content).
   let r = await tryAttempt("native", [...robust(noCookieBase), url], 20 * 60 * 1000, sourceHasNoAudio)
   if (r) return r
-  // 2. Native + cookies (only if the visitor has saved cookies for this platform)
   if (cookiesPath) {
     r = await tryAttempt("native-cookie", [...robust(withCookieBase), url], 15 * 60 * 1000, sourceHasNoAudio)
     if (r) return r
   }
-  // 3. Native + browser TLS impersonation (beats many anti-bot walls)
   if (await canImpersonate()) {
     r = await tryAttempt("impersonate", [...robust(withCookieBase), "--impersonate", "chrome", url], 15 * 60 * 1000, sourceHasNoAudio)
     if (r) return r
   }
-  // 4. Generic extractor
   r = await tryAttempt("generic", [...robust(withCookieBase), "--force-generic-extractor", url], 10 * 60 * 1000, sourceHasNoAudio)
   if (r) return r
-  // 5. Page scan → direct/HLS/DASH candidates
+
   const candidates = await scanPageForMedia(url).catch(() => [] as MediaCandidate[])
   let decoyFallback: DownloadSuccess | null = null
   for (const c of candidates) {
     if (timeLeft() < 30_000) break
-    // Embeds go through yt-dlp's native extractor (best A/V); direct single
-    // files skip format merging; manifests keep the quality selector.
     const fmt = c.kind === "direct" ? (audioOnly ? formatArgs : []) : robust([])
     const refArgs = c.kind === "embed" ? [] : ["--referer", c.referer]
     r = await tryAttempt(
@@ -682,11 +583,6 @@ export async function downloadWithFallbacks(opts: {
       sourceHasNoAudio
     )
     if (r) {
-      // Suspiciously short & tiny files are usually preview/teaser/ad
-      // decoys — keep the best one aside but try remaining candidates
-      // first. Raised the size bar (5MB) since some ad decoys are a few
-      // MB (e.g. app-install promo clips) yet still clearly not the real
-      // requested video when duration is very short.
       const suspicious = (r.durationSec ?? 0) < 15 && r.sizeBytes < 5_000_000
       if (!suspicious) return r
       if (!decoyFallback || r.sizeBytes > decoyFallback.sizeBytes) {
@@ -705,7 +601,6 @@ export async function downloadWithFallbacks(opts: {
     return { ...decoyFallback, filename: finalName, method: decoyFallback.method + ":short" }
   }
 
-  // All methods failed — classify using the most specific error we saw
   const joined = errors.join(" || ")
   const failure = classifyFailure(joined)
   const err = new Error(failure.message) as Error & { failure: ExtractionFailure }
